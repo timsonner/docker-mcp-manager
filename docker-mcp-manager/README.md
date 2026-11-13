@@ -1,197 +1,172 @@
 # Docker Container Manager MCP Server
 
-An MCP (Model Context Protocol) server that exposes tools to manage a Docker container with persistent storage, allowing AI agents (like opencode) to execute commands and manage files within the container with root privileges.
+This repository is a local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that lets an agent manage one long-running Docker container. The server speaks MCP over stdin and stdout. Its tools shell out to the `docker` CLI against a container named `managed-container`.
 
-## Features
-
-- Execute shell commands in a privileged Docker container
-- Read and write files in persistent storage
-- List directory contents
-- Check file/directory existence
-- Get container information
-- Persistent storage volume for data persistence
-- Root privileges for all operations
+File tools keep data on a Docker named volume mounted at `/data` inside that container, so files survive container restarts. `execute_command` runs a shell as root in that privileged container. The repo wires the server up for OpenCode (`opencode.json`) and VS Code (`.vscode/mcp.json`).
 
 ## Prerequisites
 
-- Docker Engine installed and running
-- Docker Compose v2
-- Python 3.10 or higher
-- `uv` package manager (recommended) or pip
+- Python 3.10 or newer, available as `python3`. The `mcp` 1.x release that provides `FastMCP` requires Python >= 3.10.
+- Docker Engine, with the `docker` CLI on `PATH`. Every tool calls `docker`.
+- Docker Compose v2 (`docker compose`) to start the service in `docker-mcp-manager/docker-compose.yml`.
 
-## Setup
+## Install, run, and test
 
-### 1. Clone the repository
+Run these from the root of the git repository (the directory that contains `docker-mcp-manager/`).
+
+### Install
 
 ```bash
-git clone <repository-url>
+python3 -m pip install 'mcp[cli]>=1.6.0,<2'
+```
+
+`docker-mcp-manager/pyproject.toml` depends on `mcp[cli]>=1.6.0`. `docker_mcp_server.py` imports `FastMCP` from `mcp.server.fastmcp`. That class is in mcp 1.x (verified with 1.30.0). mcp 2 removes it, so the upper bound is required for this code to import.
+
+There is no build step. Start the server with `python3` as shown below.
+
+### Run the container
+
+```bash
+docker compose -f docker-mcp-manager/docker-compose.yml up -d
+docker compose -f docker-mcp-manager/docker-compose.yml ps
+```
+
+`docker-mcp-manager/docker-compose.yml` defines one service:
+
+- image `ubuntu:24.04`
+- container name `managed-container`
+- `privileged: true`
+- named volume `persistent-data` mounted at `/data`
+- process `tail -f /dev/null`, so the container stays up
+
+Logs and the privileged flag:
+
+```bash
+docker compose -f docker-mcp-manager/docker-compose.yml logs managed-container
+docker inspect managed-container --format '{{.HostConfig.Privileged}}'
+```
+
+Stop the container and keep the named volume:
+
+```bash
+docker compose -f docker-mcp-manager/docker-compose.yml down
+```
+
+### Run the MCP server
+
+```bash
+python3 docker-mcp-manager/docker_mcp_server.py
+```
+
+The process stays in the foreground. MCP messages use stdin and stdout. Logs go to stderr.
+
+### Test
+
+The repository has no automated test suite. `pyproject.toml` lists optional dev dependencies `pytest`, `black`, and `ruff`, and it does not include test files or config for those tools.
+
+`docker-mcp-manager/mcp_client.py` is a manual client. It starts `python3 docker_mcp_server.py` in the current working directory, lists tools, and calls each one. Run it from `docker-mcp-manager/` after the container is up:
+
+```bash
 cd docker-mcp-manager
+python3 mcp_client.py
 ```
 
-### 2. Install dependencies
+## Usage
 
-Using uv (recommended):
-```bash
-uv sync
-```
+The server name passed to FastMCP is `docker-mcp-manager`. Tool arguments below match the Python functions in `docker_mcp_server.py`.
 
-Using pip:
-```bash
-pip install -e .
-```
+File paths are joined onto `/data`. A leading `/` is removed first, so `notes.txt` and `/notes.txt` both resolve to `/data/notes.txt`. `.` and an empty path resolve to `/data`. A path that would leave `/data` is rejected. `execute_command` is not limited to `/data`; it runs the shell string in the container.
 
-### 3. Start the managed container
-
-```bash
-docker-compose up -d
-```
-
-This will:
-- Create and start an Ubuntu 22.04 container in privileged mode
-- Mount a persistent volume at `/data` inside the container
-- Keep the container running with a `tail -f /dev/null` command
-
-### 4. Verify the container is running
-
-```bash
-docker-compose ps
-```
-
-You should see the `managed-container` service with status "Up".
-
-### 5. Run the MCP server
-
-```bash
-python3 docker_mcp_server.py
-```
-
-The server will start and communicate via stdio (required for MCP STDIO transport).
-
-## Using with OpenCode
-
-To connect this MCP server to OpenCode:
-
-1. Add the MCP server to `opencode.json` in your project root (or `~/.config/opencode/opencode.json` for global config):
-   ```json
-   {
-     "$schema": "https://opencode.ai/config.json",
-     "mcp": {
-       "docker-mcp-manager": {
-         "type": "local",
-         "command": ["python3", "docker-mcp-manager/docker_mcp_server.py"],
-         "enabled": true
-       }
-     }
-   }
-   ```
-2. Restart OpenCode to load the MCP server
-
-## Using with VS Code
-
-To connect this MCP server to VS Code (GitHub Copilot):
-
-1. Create or edit `.vscode/mcp.json` in your project root:
-   ```json
-   {
-     "servers": {
-       "docker-mcp-manager": {
-         "type": "stdio",
-         "command": "python3",
-         "args": ["docker-mcp-manager/docker_mcp_server.py"]
-       }
-     }
-   }
-   ```
-2. VS Code will prompt you to trust and start the server. You can also run **MCP: List Servers** from the Command Palette to manage it.
-
-## Available Tools
-
-Once connected, the agent will have access to these tools:
+`mcp_client.py` passes file paths such as `/data/test.txt`. After the leading slash is stripped, those resolve under `/data/data/`.
 
 ### `execute_command`
-Run shell commands in the container with root privileges.
-- **Parameters**: `command` (string) - The shell command to execute
-- **Returns**: Command output (stdout + stderr) or error message
+
+Run a shell command as root in `managed-container` (`docker exec --user root --privileged managed-container sh -c <command>`).
+
+- `command` (string): shell command
+- Returns the combined stdout and stderr. On a non-zero exit, the string starts with `Command failed with exit code`.
 
 ### `read_file`
-Read contents of a file from persistent storage.
-- **Parameters**: `file_path` (string) - Path relative to `/data` mount point
-- **Returns**: File contents as string
+
+- `file_path` (string): path under `/data`, using the join rules above
+- Returns the file contents, or an error string
 
 ### `write_file`
-Write content to a file in persistent storage.
-- **Parameters**: 
-  - `file_path` (string) - Path relative to `/data` mount point
-  - `content` (string) - Content to write
-- **Returns**: Success message or error
+
+- `file_path` (string): path under `/data`
+- `content` (string): bytes to write, decoded as text
+- Returns `Successfully wrote to <path>` or an error string
 
 ### `list_directory`
-List contents of a directory in persistent storage.
-- **Parameters**: `dir_path` (string) - Path relative to `/data` mount point
-- **Returns**: Array of filenames and directory names
+
+- `dir_path` (string): directory under `/data`
+- Returns a list of names parsed from `ls -la` (this includes `.` and `..` when `ls` prints them). On failure, returns a one-element list whose item is an error string.
 
 ### `check_file_exists`
-Check if a file or directory exists.
-- **Parameters**: `file_path` (string) - Path relative to `/data` mount point
-- **Returns**: Boolean (true if exists)
+
+- `file_path` (string): path under `/data`
+- Returns `true` or `false`. A rejected path or a failed `docker` call returns `false`.
 
 ### `get_container_info`
-Get information about the managed container.
-- **Parameters**: None
-- **Returns**: Object with container details (id, status, image, etc.)
 
-## Persistent Storage
+No parameters. When `managed-container` is running, returns an object with:
 
-All file operations default to the `/data` directory inside the container, which is mounted to a Docker named volume called `persistent-data`. This ensures data persists across container restarts.
+- `id`, `name`, `status`, `image`, `ports`
+- `host_config.privileged`
+- `host_config.binds`
 
-Example file paths:
-- `/data/config.json` (absolute inside container)
-- `config.json` (relative, resolves to `/data/config.json`)
+If the container is missing or not running, returns `{"error": "<message>"}`.
 
-## Security Notes
+### OpenCode
 
-- The container runs in privileged mode to provide root access as requested
-- All operations are confined to the container filesystem
-- The MCP server runs locally and communicates via stdio
-- Input validation is performed to prevent obvious injection attempts
-- For production use, consider additional security measures based on your threat model
+`opencode.json` at the repository root already registers the server. The command is relative to that root:
 
-## Development
-
-To run tests (when implemented):
-```bash
-uv run pytest
+```json
+{
+  "mcp": {
+    "docker-mcp-manager": {
+      "type": "local",
+      "command": ["python3", "docker-mcp-manager/docker_mcp_server.py"],
+      "enabled": true
+    }
+  }
+}
 ```
 
-To format code:
-```bash
-uv run ruff format .
+### VS Code
+
+`.vscode/mcp.json` already registers the server for the MCP client in VS Code. Paths are relative to the repository root:
+
+```json
+{
+  "servers": {
+    "docker-container-manager": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "docker-mcp-manager/docker_mcp_server.py"
+      ],
+      "env": {}
+    }
+  }
+}
 ```
 
-To check types:
-```bash
-uv run pyrefly check
-```
+## Layout
 
-## Troubleshooting
-
-### Container not starting
-```bash
-docker-compose logs managed-container
-```
-
-### MCP server connection issues
-Ensure the container is running before starting the MCP server:
-```bash
-docker-compose ps
-```
-
-### Permission denied errors
-The container runs in privileged mode and operations execute as root, so permission issues should not occur. If they do, check that the container is actually running in privileged mode:
-```bash
-docker inspect managed-container --format='{{.HostConfig.Privileged}}'
+```text
+.
+├── opencode.json
+├── .vscode/mcp.json
+├── .opencode/skills/docker-mcp-manager/SKILL.md
+└── docker-mcp-manager/
+    ├── README.md
+    ├── docker_mcp_server.py
+    ├── mcp_client.py
+    ├── docker-compose.yml
+    └── pyproject.toml
 ```
 
 ## License
 
-MIT
+This repository does not include a LICENSE file.
